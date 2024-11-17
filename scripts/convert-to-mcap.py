@@ -6,18 +6,59 @@ from loguru import logger
 from pathlib import Path
 from simplejpeg import encode_jpeg
 from zod import ZodSequences, constants
+from zod.data_classes.metadata import FrameMetaData, SequenceMetadata
 from zod.visualization.lidar_on_image import visualize_lidar_on_image
 from mcap_protobuf.writer import Writer as McapWriter
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.LocationFix_pb2 import LocationFix
 from foxglove_schemas_protobuf.LocationFix_pb2 import LocationFix
 from google.protobuf.timestamp_pb2 import Timestamp
-from google.protobuf.wrappers_pb2 import FloatValue, Int64Value, BoolValue
+from google.protobuf.wrappers_pb2 import FloatValue, Int64Value, BoolValue, StringValue
+
+
+def add_sequence_metadata_to_mcap(writer: McapWriter, metadata: SequenceMetadata):
+
+    sequence_id = metadata.sequence_id
+    country_code = metadata.country_code
+    collection_car = metadata.collection_car
+    start_time = metadata.start_time
+
+    ts = Timestamp()
+    ts.FromDatetime(start_time)
+
+    logger.info("Adding /sequence/metadata")
+
+    msg = StringValue(value=sequence_id)
+    writer.write_message(
+        topic="/sequence/metadata/sequence_id",
+        log_time=ts.ToNanoseconds(),
+        message=msg,
+        publish_time=ts.ToNanoseconds(),
+    )
+
+    msg = StringValue(value=country_code)
+    writer.write_message(
+        topic="/sequence/metadata/country_code",
+        log_time=ts.ToNanoseconds(),
+        message=msg,
+        publish_time=ts.ToNanoseconds(),
+    )
+
+    msg = StringValue(value=collection_car)
+    writer.write_message(
+        topic="/sequence/metadata/collection_car",
+        log_time=ts.ToNanoseconds(),
+        message=msg,
+        publish_time=ts.ToNanoseconds(),
+    )
 
 
 def convert_zod_sequences_to_mcap(zod_path: str, version: str = "mini", split: str = "val"):
     """
     Converts ZOD sequences to MCAP format using Foxglove Protobuf schemas (CompressedImage and Pose).
+    # TODO
+    # Add frame metadata to mcap https://github.com/yaak-ai/zod/blob/main/zod/data_classes/metadata.py#L8
+    # Add lidar point cloud as https://github.com/foxglove/schemas/blob/main/schemas/proto/foxglove/PointCloud.proto
 
     Args:
         zod_path (str): Path to the ZOD sequences dataset.
@@ -39,6 +80,10 @@ def convert_zod_sequences_to_mcap(zod_path: str, version: str = "mini", split: s
         logger.info(f"Writing {mcap_file}")
         with open(mcap_file, "wb") as pfile:
             writer = McapWriter(pfile)
+
+            # Sequence metadata
+            metadata = sequence.metadata
+            add_sequence_metadata_to_mcap(writer, metadata)
 
             # Camera data
             logger.info("Adding /sequence/camera/front")
