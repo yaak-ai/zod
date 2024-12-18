@@ -146,6 +146,7 @@ def convert_zod_sequences_to_mcap(
 
         if mcap_file.exists() and skip:
             logger.info(f"Skipping {mcap_file}, exists")
+            continue
 
         logger.info(f"Writing {mcap_file}")
         with open(mcap_file, "wb") as pfile:
