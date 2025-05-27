@@ -1,15 +1,18 @@
 from genericpath import exists
 import os
-import cv2
+import ffmpeg
 import tqdm
+import sys
 import struct
+import json
 import numpy as np
 from loguru import logger
 from pathlib import Path
 from simplejpeg import encode_jpeg
-from zod import ZodSequences, constants
+from zod import ZodSequences, ZodDrives, constants
 from zod.constants import Lidar
 from argparse import ArgumentParser
+from fractions import Fraction
 from zod.data_classes.metadata import FrameMetaData, SequenceMetadata
 from zod.visualization.lidar_on_image import visualize_lidar_on_image
 from mcap_protobuf.writer import Writer as McapWriter
@@ -21,6 +24,7 @@ from foxglove_schemas_protobuf.Pose_pb2 import Pose
 from google.protobuf.timestamp_pb2 import Timestamp
 from google.protobuf.wrappers_pb2 import FloatValue, Int64Value, BoolValue, StringValue
 from scipy.spatial.transform import Rotation as R
+from protos.python.intercom.proto.sensor_pb2 import ImageMetadata
 
 
 def extrinsics_to_translation_quaternion(matrix):
@@ -117,7 +121,7 @@ def add_sequence_metadata_to_mcap(writer: McapWriter, metadata: SequenceMetadata
 
 
 def convert_zod_sequences_to_mcap(
-    zod_path: str, version: str = "mini", split: str = "val", dest_dir: str = "", skip: bool = False,
+    zod_path: str, version: str = "mini", split: str = "val", dest_dir: str = "", skip: bool = False, sequence: bool = False, drives: bool = False
 ):
     """
     Converts ZOD sequences to MCAP format using Foxglove Protobuf schemas (CompressedImage and Pose).
@@ -130,7 +134,9 @@ def convert_zod_sequences_to_mcap(
         output_path (str): Path to the output MCAP file.
     """
     # Load the ZodSequences dataset
-    dataset = ZodSequences(dataset_root=zod_path, version=version)  # Adjust as needed
+    Base = ZodSequences if sequence else ZodDrives
+    mcap_prefix = "sequence" if sequence else "drive"
+    dataset = Base(dataset_root=zod_path, version=version)  # Adjust as needed
     validation_sequences = dataset.get_split(split)
 
     for sequence_id in tqdm.tqdm(validation_sequences, ascii=True, unit="seq"):
@@ -140,7 +146,7 @@ def convert_zod_sequences_to_mcap(
         # Open MCAP file with Protobuf writer
         # s3://yapi-external-datasets/<vendor>/<robot>/<dataset>/<episode_id>/episode.mcap
         mcap_file = Path(
-            f"{dest_dir}/{car}/{version}/{split}-{sequence_id}/sequence.mcap"
+            f"{dest_dir}/{car}/{version}/{split}-{sequence_id}/{mcap_prefix}.mcap"
         )
         mcap_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -167,13 +173,12 @@ def convert_zod_sequences_to_mcap(
             lons = satellite.lonpos * 1e-9
             alts = satellite.altitude
             headings = satellite.heading
+            speeds = satellite.speed
             timstamps = satellite.timstamp
-            # TODO skip for now
-            # speeds = satellite.speeds
             ts = Timestamp()
             logger.info("Adding /sequence/vehicle_data/satellite")
-            for lat, lon, alt, heading, ts_nanos in tqdm.tqdm(
-                zip(lats, lons, alts, headings, timstamps),
+            for lat, lon, alt, heading, speed, ts_nanos in tqdm.tqdm(
+                zip(lats, lons, alts, headings, speeds, timstamps),
                 ascii=True,
                 unit="gnss",
                 total=len(timstamps),
@@ -192,6 +197,15 @@ def convert_zod_sequences_to_mcap(
                     topic="/sequence/vehicle_data/satellite",
                     log_time=ts.ToNanoseconds(),
                     message=gnss,
+                    publish_time=ts.ToNanoseconds(),
+                )
+
+                msg = FloatValue(value=speed)
+                ts.FromNanoseconds(int(ts_nanos))
+                writer.write_message(
+                    topic="/sequence/vehicle_data/speed",
+                    log_time=ts.ToNanoseconds(),
+                    message=msg,
                     publish_time=ts.ToNanoseconds(),
                 )
 
@@ -401,51 +415,88 @@ def convert_zod_sequences_to_mcap(
 
             # Camera + Lidar data
             logger.info("Adding /sequence/camera/front")
-            logger.info(f"Adding /sequence/lidar/{Lidar.VELODYNE.value}")
+            # logger.info(f"Adding /sequence/lidar/{Lidar.VELODYNE.value}")
+            video_file = mcap_file.parent.joinpath("front.mp4")
 
-            for camera_frame in tqdm.tqdm(camera_frames, ascii=True, unit="frame"):
+            process = (
+                ffmpeg
+                .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{camera_frames[0].width}x{camera_frames[0].height}', framerate=10.1)
+                .output(
+                    video_file.as_posix(),
+                    vcodec='h264',
+                    pix_fmt='yuv420p',
+                    rc='vbr',
+                    bitrate='16M'
+                )
+                .overwrite_output()
+                .run_async(pipe_stdin=True)
+            )
+
+            pbar = tqdm.tqdm(camera_frames, ascii=True, unit="frame")
+            for camera_frame in pbar:
                 image = camera_frame.read()
                 if image is None:
                     continue
+
                 # Encode image as JPEG
                 # image_resize = cv2.resize(
                 #     image, dsize=(480, 270), interpolation=cv2.INTER_AREA
                 # )
-                bytes = encode_jpeg(image)
+                # bytes = encode_jpeg(image)
 
                 # Create CompressedImage message
                 ts = Timestamp()
                 ts.FromDatetime(camera_frame.time)
-                img = CompressedImage(
-                    timestamp=ts,
-                    format="jpeg",
-                    data=bytes,
-                )
+
+                img_msg = ImageMetadata()
+
+                img_msg.camera_name = "front"
+                img_msg.encoding = "h264"
+                img_msg.frame_idx = pbar.n
+                img_msg.height = image.shape[0]
+                img_msg.width = image.shape[1]
+                img_msg.time_stamp = camera_frame.time
 
                 writer.write_message(
                     topic="/sequence/camera/front",
                     log_time=ts.ToNanoseconds(),
+                    message=img_msg,
                     publish_time=ts.ToNanoseconds(),
-                    message=img,
                 )
 
-                lidar = sequence.info.get_lidar_frame(camera_frame.time).read()
-                extrinsics = sequence.calibration.lidars[Lidar.VELODYNE].extrinsics
-                w, t = extrinsics_to_translation_quaternion(extrinsics.transform)
-                lidar_msg = lidar_data_to_pointcloud_message(
-                    lidar, camera_frame.time, w, t
-                )
+                process.stdin.write(image.tobytes())
 
-                writer.write_message(
-                    topic=f"/sequence/lidar/{Lidar.VELODYNE.value}",
-                    log_time=ts.ToNanoseconds(),
-                    publish_time=ts.ToNanoseconds(),
-                    message=lidar_msg,
-                )
+                # img = CompressedImage(
+                #     timestamp=ts,
+                #     format="jpeg",
+                #     data=bytes,
+                # )
 
+                # writer.write_message(
+                #     topic="/sequence/camera/front",
+                #     log_time=ts.ToNanoseconds(),
+                #     publish_time=ts.ToNanoseconds(),
+                #     message=img,
+                # )
+                # lidar = sequence.info.get_lidar_frame(camera_frame.time).read()
+                # extrinsics = sequence.calibration.lidars[Lidar.VELODYNE].extrinsics
+                # w, t = extrinsics_to_translation_quaternion(extrinsics.transform)
+                # lidar_msg = lidar_data_to_pointcloud_message(
+                #     lidar, camera_frame.time, w, t
+                # )
+
+                # writer.write_message(
+                #     topic=f"/sequence/lidar/{Lidar.VELODYNE.value}",
+                #     log_time=ts.ToNanoseconds(),
+                #     publish_time=ts.ToNanoseconds(),
+                #     message=lidar_msg,
+                # )
+
+            process.stdin.close()
+            process.wait()
             writer.finish()
-
             logger.info(f"Done writing {mcap_file}")
+            logger.info(f"Done writing {video_file}")
 
 
 if __name__ == "__main__":
@@ -485,9 +536,31 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "-q",
+        "--sequence",
+        help="Covery sequence",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "-u",
+        "--drives",
+        help="Convery drives",
+        action="store_true",
+        default=False,
+    )
 
     args = parser.parse_args()
 
+    if not (args.sequence or args.drives):
+        logger.info("Set either --sequence or --drives")
+        sys.exit(1)
+
+    if args.sequence and args.drives:
+        logger.info("Set only --sequence or --drives")
+        sys.exit(1)
+
     convert_zod_sequences_to_mcap(
-        args.root, args.version, args.split, args.dest, args.skip_existing
+        args.root, args.version, args.split, args.dest, args.skip_existing, args.sequence, args.drives
     )
